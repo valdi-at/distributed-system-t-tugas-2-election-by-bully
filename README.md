@@ -86,6 +86,14 @@ with specified port range:
 bash run.sh -range 10000-10100
 ```
 
+## Usefull tools
+
+Kill app that serve port `9000`
+
+```sh
+kill $(lsof -ti:9000)
+```
+
 ## Example Output
 
 ```txt
