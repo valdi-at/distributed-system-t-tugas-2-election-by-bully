@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -19,13 +20,15 @@ import (
 )
 
 const (
-	defaultPort       = 9000
 	replyTimeout      = time.Second
 	retryDelay        = 200 * time.Millisecond
 	logInterval       = 3 * time.Second
 	heartbeatInterval = time.Second
 	heartbeatTTL      = 3 * time.Second // no ping for this long -> coordinator drops the node
 )
+
+// cluster port range defaultPort = start, lastPort = end, inclusive
+var defaultPort, lastPort int
 
 type node struct {
 	port int
@@ -100,6 +103,42 @@ func parsePorts(str string) ([]int, error) {
 	return ports, nil
 }
 
+// e.g. "9000-9100" into 9000, 9100
+func parseRange(str string) (int, int, error) {
+	a, b, ok := strings.Cut(str, "-")
+	if !ok {
+		return 0, 0, errors.New("should look like 9000-9100")
+	}
+	first, err := strconv.Atoi(a)
+	if err != nil {
+		return 0, 0, err
+	}
+	last, err := strconv.Atoi(b)
+	if err != nil {
+		return 0, 0, err
+	}
+	if first < 1 || last > 65535 || first >= last {
+		return 0, 0, errors.New("need 1 <= first < last <= 65535")
+	}
+	return first, last, nil
+}
+
+// search nodes in the port range one by one and returns the port list of the first node that answers
+func findCluster() ([]int, bool) {
+	for port := defaultPort + 1; port <= lastPort; port++ {
+		reply, err := request(port, "PORTS")
+		if err != nil {
+			continue
+		}
+		ports, err := parsePorts(reply)
+		if err != nil {
+			continue
+		}
+		return slices.DeleteFunc(ports, func(p int) bool { return p == defaultPort }), true
+	}
+	return nil, false
+}
+
 func (nodeInfo *node) knownPorts() []int {
 	nodeInfo.mu.Lock()
 	defer nodeInfo.mu.Unlock()
@@ -124,6 +163,17 @@ func (nodeInfo *node) setCoordinator(port int) {
 	nodeInfo.mu.Lock()
 	defer nodeInfo.mu.Unlock()
 	nodeInfo.coordinator = port
+}
+
+// set coordinator to 0
+func (nodeInfo *node) clearCoordinator(port int) bool {
+	nodeInfo.mu.Lock()
+	defer nodeInfo.mu.Unlock()
+	if nodeInfo.coordinator != port {
+		return false
+	}
+	nodeInfo.coordinator = 0
+	return true
 }
 
 func (nodeInfo *node) addNeighbor(port int) {
@@ -236,8 +286,14 @@ func (nodeInfo *node) heartbeat() {
 		if coord == 0 || coord == nodeInfo.port {
 			continue // dont know it yet, or it could be ourself
 		}
-		// if this fails the coordinator might be dead, nothing to do about it yet (no election)
-		request(coord, "PING "+strconv.Itoa(nodeInfo.port))
+		// no PONG -> coordinator is ded, go to no coordinator (no election yet)
+		reply, err := request(coord, "PING "+strconv.Itoa(nodeInfo.port))
+		if err == nil && reply != "PONG" {
+			err = fmt.Errorf("weird reply %q", reply)
+		}
+		if err != nil && nodeInfo.clearCoordinator(coord) {
+			log.Printf("[%d] coordinator %d didnt answer ping (%v), no coordinator now", nodeInfo.port, coord, err)
+		}
 	}
 }
 
@@ -259,6 +315,14 @@ func (nodeInfo *node) watchNeighbors() {
 }
 
 func main() {
+	portRange := flag.String("range", "9000-9100", "cluster port range, first-last (first one is the default port)")
+	flag.Parse()
+	first, last, err := parseRange(*portRange)
+	if err != nil {
+		log.Fatalf("bad -range %q: %v", *portRange, err)
+	}
+	defaultPort, lastPort = first, last
+
 	nodeInfo := &node{lastSeen: map[int]time.Time{}} // list of nodes
 
 	// port selection
@@ -269,10 +333,18 @@ func main() {
 			// if default port inactive -> serve default port -> if failed, retry if port active again and get response again(maybe another machine is starting)
 			if sock, err := listen(defaultPort); err == nil {
 				nodeInfo.port, nodeInfo.sock = defaultPort, sock
-				nodeInfo.coordinator = defaultPort
+				// default port being free doesnt mean we are first, maybe the old one died and the rest are still up
+				if ports, found := findCluster(); found {
+					nodeInfo.neighbors = ports // we join them below like any other node, coordinator comes from them
+				} else {
+					nodeInfo.coordinator = defaultPort // nobody else is up, we are the first
+				}
 			}
 		} else if ports, err := parsePorts(reply); err == nil {
 			port := slices.Max(ports) + 1
+			if port > lastPort {
+				log.Fatalf("no free port left in %d-%d", defaultPort, lastPort)
+			}
 
 			// if there isnt -> get the highest port and increment, use that as current port -> if failed retry
 			if sock, err := listen(port); err == nil {
