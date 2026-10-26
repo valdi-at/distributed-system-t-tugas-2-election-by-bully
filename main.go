@@ -19,10 +19,12 @@ import (
 )
 
 const (
-	defaultPort  = 9000
-	replyTimeout = time.Second
-	retryDelay   = 200 * time.Millisecond
-	logInterval  = 3 * time.Second
+	defaultPort       = 9000
+	replyTimeout      = time.Second
+	retryDelay        = 200 * time.Millisecond
+	logInterval       = 3 * time.Second
+	heartbeatInterval = time.Second
+	heartbeatTTL      = 3 * time.Second // no ping for this long -> coordinator drops the node
 )
 
 type node struct {
@@ -31,7 +33,8 @@ type node struct {
 
 	mu          sync.Mutex
 	neighbors   []int
-	coordinator int // 0 = dunno
+	coordinator int               // 0 = dunno
+	lastSeen    map[int]time.Time // last ping from each neighbor, only used by the coordinator
 }
 
 func url(port int) string {
@@ -131,9 +134,53 @@ func (nodeInfo *node) addNeighbor(port int) {
 	}
 }
 
+func (nodeInfo *node) removeNeighbor(port int) {
+	nodeInfo.mu.Lock()
+	defer nodeInfo.mu.Unlock()
+	nodeInfo.neighbors = slices.DeleteFunc(nodeInfo.neighbors, func(p int) bool { return p == port })
+	delete(nodeInfo.lastSeen, port)
+}
+
+// touch records a ping from port (ignored if its not a neighbor)
+func (nodeInfo *node) touch(port int) {
+	nodeInfo.mu.Lock()
+	defer nodeInfo.mu.Unlock()
+	if slices.Contains(nodeInfo.neighbors, port) {
+		nodeInfo.lastSeen[port] = time.Now()
+	}
+}
+
+// removes all neighbors that havent pinged within heartbeatTTL, returns the lazy ahh neighbors
+func (nodeInfo *node) dropExpired() []int {
+	nodeInfo.mu.Lock()
+	defer nodeInfo.mu.Unlock()
+
+	now := time.Now()
+	var expired []int
+	for _, port := range nodeInfo.neighbors {
+		seen, ok := nodeInfo.lastSeen[port]
+		if !ok {
+			// new node or we just become coordinator
+			nodeInfo.lastSeen[port] = now
+			continue
+		}
+		if now.Sub(seen) > heartbeatTTL {
+			expired = append(expired, port)
+		}
+	}
+
+	nodeInfo.neighbors = slices.DeleteFunc(nodeInfo.neighbors, func(p int) bool { return slices.Contains(expired, p) })
+	for _, port := range expired {
+		delete(nodeInfo.lastSeen, port)
+	}
+	return expired
+}
+
 // serve answers requests from other nodes:
 //	PORTS		every port this node knows (itself included)
 //	JOIN <port> add port to neighbors, reply with our coordinator (0 if we dont know yet)
+//	PING <port> heartbeat from port, the coordinator uses it for the ttl
+//	DROP <port> remove port from neighbors (sent by the coordinator)
 func (nodeInfo *node) serve() {
 	for {
 		msg, err := nodeInfo.sock.Recv()
@@ -158,6 +205,20 @@ func (nodeInfo *node) serve() {
 			}
 			nodeInfo.addNeighbor(p)
 			reply = strconv.Itoa(nodeInfo.getCoordinator())
+		case "PING":
+			if p, err := strconv.Atoi(arg); err == nil {
+				nodeInfo.touch(p)
+			}
+			reply = "PONG"
+		case "DROP":
+			p, err := strconv.Atoi(arg)
+			if err != nil {
+				reply = "ERR bad port"
+				break
+			}
+			nodeInfo.removeNeighbor(p)
+			log.Printf("[%d] coordinator says %d is gone, dropped it", nodeInfo.port, p)
+			reply = "OK"
 		default:
 			reply = "ERR unknown command"
 		}
@@ -168,8 +229,37 @@ func (nodeInfo *node) serve() {
 	}
 }
 
+// ping coordinator every sec
+func (nodeInfo *node) heartbeat() {
+	for range time.Tick(heartbeatInterval) {
+		coord := nodeInfo.getCoordinator()
+		if coord == 0 || coord == nodeInfo.port {
+			continue // dont know it yet, or it could be ourself
+		}
+		// if this fails the coordinator might be dead, nothing to do about it yet (no election)
+		request(coord, "PING "+strconv.Itoa(nodeInfo.port))
+	}
+}
+
+//  coordinator only, drop lazy ahh neighbors and tell others to do the same
+func (nodeInfo *node) watchNeighbors() {
+	for range time.Tick(heartbeatInterval) {
+		if nodeInfo.getCoordinator() != nodeInfo.port {
+			continue
+		}
+		for _, dead := range nodeInfo.dropExpired() {
+			log.Printf("[%d] no ping from %d for %v, dropping it", nodeInfo.port, dead, heartbeatTTL)
+			for _, port := range nodeInfo.neighborList() {
+				if _, err := request(port, "DROP "+strconv.Itoa(dead)); err != nil {
+					log.Printf("[%d] drop %d at %d: %v", nodeInfo.port, dead, port, err)
+				}
+			}
+		}
+	}
+}
+
 func main() {
-	nodeInfo := &node{} // list of nodes
+	nodeInfo := &node{lastSeen: map[int]time.Time{}} // list of nodes
 
 	// port selection
 	for nodeInfo.sock == nil {
@@ -220,6 +310,8 @@ func main() {
 		}
 	}
 	log.Printf("[%d] coordinator is %d", nodeInfo.port, nodeInfo.getCoordinator())
+	go nodeInfo.heartbeat()
+	go nodeInfo.watchNeighbors()
 
 	for range time.Tick(logInterval) {
 		log.Printf("[%d] coordinator %d, neighbors %v", nodeInfo.port, nodeInfo.getCoordinator(), nodeInfo.neighborList())
