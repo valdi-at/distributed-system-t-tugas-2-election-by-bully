@@ -29,8 +29,9 @@ type node struct {
 	port int
 	sock mangos.Socket
 
-	mu        sync.Mutex
-	neighbors []int
+	mu          sync.Mutex
+	neighbors   []int
+	coordinator int // 0 = dunno
 }
 
 func url(port int) string {
@@ -110,6 +111,18 @@ func (nodeInfo *node) neighborList() []int {
 	return slices.Sorted(slices.Values(nodeInfo.neighbors))
 }
 
+func (nodeInfo *node) getCoordinator() int {
+	nodeInfo.mu.Lock()
+	defer nodeInfo.mu.Unlock()
+	return nodeInfo.coordinator
+}
+
+func (nodeInfo *node) setCoordinator(port int) {
+	nodeInfo.mu.Lock()
+	defer nodeInfo.mu.Unlock()
+	nodeInfo.coordinator = port
+}
+
 func (nodeInfo *node) addNeighbor(port int) {
 	nodeInfo.mu.Lock()
 	defer nodeInfo.mu.Unlock()
@@ -120,7 +133,7 @@ func (nodeInfo *node) addNeighbor(port int) {
 
 // serve answers requests from other nodes:
 //	PORTS		every port this node knows (itself included)
-//	JOIN <port> add port to neighbors
+//	JOIN <port> add port to neighbors, reply with our coordinator (0 if we dont know yet)
 func (nodeInfo *node) serve() {
 	for {
 		msg, err := nodeInfo.sock.Recv()
@@ -144,7 +157,7 @@ func (nodeInfo *node) serve() {
 				break
 			}
 			nodeInfo.addNeighbor(p)
-			reply = "OK"
+			reply = strconv.Itoa(nodeInfo.getCoordinator())
 		default:
 			reply = "ERR unknown command"
 		}
@@ -166,6 +179,7 @@ func main() {
 			// if default port inactive -> serve default port -> if failed, retry if port active again and get response again(maybe another machine is starting)
 			if sock, err := listen(defaultPort); err == nil {
 				nodeInfo.port, nodeInfo.sock = defaultPort, sock
+				nodeInfo.coordinator = defaultPort
 			}
 		} else if ports, err := parsePorts(reply); err == nil {
 			port := slices.Max(ports) + 1
@@ -193,14 +207,21 @@ func main() {
 	log.Printf("[%d] up, neighbors %v", nodeInfo.port, nodeInfo.neighbors)
 	go nodeInfo.serve()
 
-	// tell every node we know about that we exist
+	// tell every node we exist, they reply with their coordinator
 	for _, port := range nodeInfo.neighborList() {
-		if _, err := request(port, "JOIN "+strconv.Itoa(nodeInfo.port)); err != nil {
+		reply, err := request(port, "JOIN "+strconv.Itoa(nodeInfo.port))
+		if err != nil {
 			log.Printf("[%d] join %d: %v", nodeInfo.port, port, err)
+			continue
+		}
+		// take the first one that knows
+		if coord, err := strconv.Atoi(reply); err == nil && coord != 0 && nodeInfo.getCoordinator() == 0 {
+			nodeInfo.setCoordinator(coord)
 		}
 	}
+	log.Printf("[%d] coordinator is %d", nodeInfo.port, nodeInfo.getCoordinator())
 
 	for range time.Tick(logInterval) {
-		log.Printf("[%d] neighbors %v", nodeInfo.port, nodeInfo.neighborList())
+		log.Printf("[%d] coordinator %d, neighbors %v", nodeInfo.port, nodeInfo.getCoordinator(), nodeInfo.neighborList())
 	}
 }
