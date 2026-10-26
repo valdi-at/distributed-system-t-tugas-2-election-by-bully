@@ -173,6 +173,8 @@ func (nodeInfo *node) clearCoordinator(port int) bool {
 		return false
 	}
 	nodeInfo.coordinator = 0
+	nodeInfo.neighbors = slices.DeleteFunc(nodeInfo.neighbors, func(p int) bool { return p == port })
+	delete(nodeInfo.lastSeen, port)
 	return true
 }
 
