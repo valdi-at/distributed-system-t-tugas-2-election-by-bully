@@ -25,6 +25,7 @@ const (
 	logInterval       = 3 * time.Second
 	heartbeatInterval = time.Second
 	heartbeatTTL      = 3 * time.Second // no ping for this long -> coordinator drops the node
+	electionTimeout   = 3 * time.Second // got OK from a higher node but no ELECTION_COORD for this long -> run election again
 )
 
 // cluster port range defaultPort = start, lastPort = end, inclusive
@@ -38,6 +39,7 @@ type node struct {
 	neighbors   []int
 	coordinator int               // 0 = dunno
 	lastSeen    map[int]time.Time // last ping from each neighbor, only used by the coordinator
+	electing    bool              // an election is running right now, dont start another one
 }
 
 func url(port int) string {
@@ -178,6 +180,14 @@ func (nodeInfo *node) clearCoordinator(port int) bool {
 	return true
 }
 
+// make ourself the coordinator, lastSeen starts fresh so nobody gets dropped because of old timestamps
+func (nodeInfo *node) claimCoordinator() {
+	nodeInfo.mu.Lock()
+	defer nodeInfo.mu.Unlock()
+	nodeInfo.coordinator = nodeInfo.port
+	clear(nodeInfo.lastSeen)
+}
+
 func (nodeInfo *node) addNeighbor(port int) {
 	nodeInfo.mu.Lock()
 	defer nodeInfo.mu.Unlock()
@@ -233,6 +243,8 @@ func (nodeInfo *node) dropExpired() []int {
 //	JOIN <port> add port to neighbors, reply with our coordinator (0 if we dont know yet)
 //	PING <port> heartbeat from port, the coordinator uses it for the ttl
 //	DROP <port> remove port from neighbors (sent by the coordinator)
+//	ELECTION_ASK <port>		reply OK and start our own election (port is who asked)
+//	ELECTION_COORD <port>	port won the election, set it as our coordinator
 func (nodeInfo *node) serve() {
 	for {
 		msg, err := nodeInfo.sock.Recv()
@@ -271,6 +283,22 @@ func (nodeInfo *node) serve() {
 			nodeInfo.removeNeighbor(p)
 			log.Printf("[%d] coordinator says %d is gone, dropped it", nodeInfo.port, p)
 			reply = "OK"
+		case "ELECTION_ASK":
+			log.Printf("[%d] got ELECTION_ASK from %s", nodeInfo.port, arg)
+			reply = "OK"
+			nodeInfo.startElection()
+		case "ELECTION_COORD":
+			p, err := strconv.Atoi(arg)
+			if err != nil {
+				reply = "ERR bad port"
+				break
+			}
+			nodeInfo.addNeighbor(p)
+			if nodeInfo.getCoordinator() != p {
+				log.Printf("[%d] %d won the election, its the coordinator now", nodeInfo.port, p)
+			}
+			nodeInfo.setCoordinator(p)
+			reply = "OK"
 		default:
 			reply = "ERR unknown command"
 		}
@@ -285,17 +313,81 @@ func (nodeInfo *node) serve() {
 func (nodeInfo *node) heartbeat() {
 	for range time.Tick(heartbeatInterval) {
 		coord := nodeInfo.getCoordinator()
-		if coord == 0 || coord == nodeInfo.port {
-			continue // dont know it yet, or it could be ourself
+		if coord == nodeInfo.port {
+			continue // itsa me! the coordinator
 		}
-		// no PONG -> coordinator is ded, go to no coordinator (no election yet)
+		if coord == 0 {
+			// no coordinator (we joined in the middle of an election or something), go find one
+			nodeInfo.startElection()
+			continue
+		}
+		// no PONG -> coordinator is ded, go to no coordinator and start an election
 		reply, err := request(coord, "PING "+strconv.Itoa(nodeInfo.port))
 		if err == nil && reply != "PONG" {
 			err = fmt.Errorf("weird reply %q", reply)
 		}
 		if err != nil && nodeInfo.clearCoordinator(coord) {
 			log.Printf("[%d] coordinator %d didnt answer ping (%v), no coordinator now", nodeInfo.port, coord, err)
+			nodeInfo.startElection()
 		}
+	}
+}
+
+// startElection runs election in the background, unless one is already running on this node
+func (nodeInfo *node) startElection() {
+	nodeInfo.mu.Lock()
+	defer nodeInfo.mu.Unlock()
+	if nodeInfo.electing {
+		return
+	}
+	nodeInfo.electing = true
+
+	go func() {
+		nodeInfo.election()
+		nodeInfo.mu.Lock()
+		nodeInfo.electing = false
+		nodeInfo.mu.Unlock()
+	}()
+}
+
+// bully election: send ELECTION_ASK to every higher port
+// nobody answers OK -> we are the highest one alive, become coordinator and send ELECTION_COORD to everyone
+// someone answers OK -> they run their own election, we wait for their ELECTION_COORD
+// (if it doesnt come within electionTimeout, the higher one probably died too, so go again)
+func (nodeInfo *node) election() {
+	for {
+		nodeInfo.setCoordinator(0) // were picking a new one
+		log.Printf("[%d] starting election", nodeInfo.port)
+
+		higherAlive := false
+		for _, port := range nodeInfo.neighborList() {
+			if port <= nodeInfo.port {
+				continue
+			}
+			if reply, err := request(port, "ELECTION_ASK "+strconv.Itoa(nodeInfo.port)); err == nil && reply == "OK" {
+				higherAlive = true
+			}
+		}
+
+		if !higherAlive {
+			nodeInfo.claimCoordinator()
+			log.Printf("[%d] nobody higher answered, im the coordinator now", nodeInfo.port)
+			for _, port := range nodeInfo.neighborList() {
+				if _, err := request(port, "ELECTION_COORD "+strconv.Itoa(nodeInfo.port)); err != nil {
+					log.Printf("[%d] ELECTION_COORD to %d: %v", nodeInfo.port, port, err)
+				}
+			}
+			return
+		}
+
+		deadline := time.Now().Add(electionTimeout)
+		for time.Now().Before(deadline) && nodeInfo.getCoordinator() == 0 {
+			time.Sleep(100 * time.Millisecond)
+		}
+		if nodeInfo.getCoordinator() != 0 {
+			return
+		}
+		log.Printf("[%d] got OK but nobody sent ELECTION_COORD in %v, trying again", nodeInfo.port, electionTimeout)
 	}
 }
 
