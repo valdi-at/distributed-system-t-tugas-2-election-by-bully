@@ -193,9 +193,10 @@ func main() {
 	log.Printf("[%d] up, neighbors %v", nodeInfo.port, nodeInfo.neighbors)
 	go nodeInfo.serve()
 
-	if nodeInfo.port != defaultPort {
-		if _, err := request(defaultPort, "JOIN "+strconv.Itoa(nodeInfo.port)); err != nil {
-			log.Printf("[%d] join: %v", nodeInfo.port, err)
+	// tell every node we know about that we exist
+	for _, port := range nodeInfo.neighborList() {
+		if _, err := request(port, "JOIN "+strconv.Itoa(nodeInfo.port)); err != nil {
+			log.Printf("[%d] join %d: %v", nodeInfo.port, port, err)
 		}
 	}
 
