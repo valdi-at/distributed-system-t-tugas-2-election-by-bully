@@ -6,6 +6,6 @@ go build -o node . || exit 1
 
 trap 'kill $(jobs -p) 2>/dev/null' INT TERM EXIT
 for i in 1 2 3 4 5 6 7; do
-	./node &
+	./node "$@" &
 done
 wait
