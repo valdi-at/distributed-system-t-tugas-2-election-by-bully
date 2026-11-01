@@ -4,6 +4,12 @@
 | --------------------------- | ---------- |
 | Mohamad Valdi Ananda Tauhid | 5025221238 |
 
+| Implementation        | Repository                                                                                                                                   |
+| --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| original              | [master](https://github.com/valdi-at/distributed-system-t-tugas-2-election-by-bully/tree/master)                                             |
+| Request - Reply       | [protocol/req-rep](https://github.com/valdi-at/distributed-system-t-tugas-2-election-by-bully/tree/protocol/req-rep)                         |
+| Surveyor - Respondent | [protocol/surveyor-respondent](https://github.com/valdi-at/distributed-system-t-tugas-2-election-by-bully/tree/protocol/surveyor-respondent) |
+
 ## General Structure
 
 Each node is its own application using the same binary.
