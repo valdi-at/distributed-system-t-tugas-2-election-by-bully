@@ -7,16 +7,18 @@ import (
 	"strings"
 
 	"go.nanomsg.org/mangos/v3"
-	"go.nanomsg.org/mangos/v3/protocol/rep"
-	"go.nanomsg.org/mangos/v3/protocol/req"
+	"go.nanomsg.org/mangos/v3/protocol/respondent"
+	"go.nanomsg.org/mangos/v3/protocol/surveyor"
 )
+
+var errNoReply = errors.New("no reply")
 
 func url(port int) string {
 	return fmt.Sprintf("tcp://127.0.0.1:%d", port)
 }
 
 func listen(port int) (mangos.Socket, error) {
-	sock, err := rep.NewSocket()
+	sock, err := respondent.NewSocket()
 	if err != nil {
 		return nil, err
 	}
@@ -27,26 +29,53 @@ func listen(port int) (mangos.Socket, error) {
 	return sock, nil
 }
 
-func request(port int, msg string) (string, error) {
-	sock, err := req.NewSocket()
+// survey sends a msg to all port and get all of the replies until all of them answered or replyTimeout ran out
+// dead ports are skipped, err is only set when none of the ports responds
+func survey(ports []int, msg string) ([]string, error) {
+	sock, err := surveyor.NewSocket()
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	defer sock.Close()
-	sock.SetOption(mangos.OptionSendDeadline, replyTimeout)
-	sock.SetOption(mangos.OptionRecvDeadline, replyTimeout)
+	sock.SetOption(mangos.OptionSurveyTime, replyTimeout)
 
-	if err := sock.Dial(url(port)); err != nil {
-		return "", err
+	dialed := 0
+	err = errNoReply
+	for _, port := range ports {
+		if dialErr := sock.Dial(url(port)); dialErr != nil {
+			err = dialErr
+			continue
+		}
+		dialed++
+	}
+	if dialed == 0 {
+		return nil, err
 	}
 	if err := sock.Send([]byte(msg)); err != nil {
-		return "", err
+		return nil, err
 	}
-	reply, err := sock.Recv()
+
+	var replies []string
+	for len(replies) < dialed {
+		reply, err := sock.Recv()
+		if err != nil {
+			break // ErrProtoState = survey expired
+		}
+		replies = append(replies, string(reply))
+	}
+	return replies, nil
+}
+
+// request is a survey to a single port, basically like req/rep with a deadline :P
+func request(port int, msg string) (string, error) {
+	replies, err := survey([]int{port}, msg)
 	if err != nil {
 		return "", err
 	}
-	return string(reply), nil
+	if len(replies) == 0 {
+		return "", errNoReply
+	}
+	return replies[0], nil
 }
 
 // list of integer port into formatted string port

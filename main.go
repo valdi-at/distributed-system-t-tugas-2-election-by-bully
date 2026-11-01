@@ -40,13 +40,14 @@ type node struct {
 	electing    bool              // an election is running right now, dont start another one
 }
 
-// search nodes in the port range one by one and returns the port list of the first node that answers
+// survey the whole port range and returns the port list of the first node that answers
 func findCluster() ([]int, bool) {
+	var targets []int
 	for port := defaultPort + 1; port <= lastPort; port++ {
-		reply, err := request(port, "PORTS")
-		if err != nil {
-			continue
-		}
+		targets = append(targets, port)
+	}
+	replies, _ := survey(targets, "PORTS")
+	for _, reply := range replies {
 		ports, err := parsePorts(reply)
 		if err != nil {
 			continue
@@ -265,8 +266,8 @@ func (nodeInfo *node) startElection() {
 	}()
 }
 
-// bully election: send ELECTION_ASK to every higher port
-// nobody answers OK -> we are the highest one alive, become coordinator and send ELECTION_COORD to everyone
+// bully election: survey every higher port with ELECTION_ASK in one go
+// nobody answers OK -> we are the highest one alive, become coordinator and survey ELECTION_COORD to everyone
 // someone answers OK -> they run their own election, we wait for their ELECTION_COORD
 // (if it doesnt come within electionTimeout, the higher one probably died too, so go again)
 func (nodeInfo *node) election() {
@@ -274,24 +275,18 @@ func (nodeInfo *node) election() {
 		nodeInfo.setCoordinator(0) // were picking a new one
 		log.Printf("[%d] starting election", nodeInfo.port)
 
-		higherAlive := false
+		var higher []int
 		for _, port := range nodeInfo.neighborList() {
-			if port <= nodeInfo.port {
-				continue
-			}
-			if reply, err := request(port, "ELECTION_ASK "+strconv.Itoa(nodeInfo.port)); err == nil && reply == "OK" {
-				higherAlive = true
+			if port > nodeInfo.port {
+				higher = append(higher, port)
 			}
 		}
+		replies, _ := survey(higher, "ELECTION_ASK "+strconv.Itoa(nodeInfo.port))
 
-		if !higherAlive {
+		if !slices.Contains(replies, "OK") {
 			nodeInfo.claimCoordinator()
 			log.Printf("[%d] nobody higher answered, im the coordinator now", nodeInfo.port)
-			for _, port := range nodeInfo.neighborList() {
-				if _, err := request(port, "ELECTION_COORD "+strconv.Itoa(nodeInfo.port)); err != nil {
-					log.Printf("[%d] ELECTION_COORD to %d: %v", nodeInfo.port, port, err)
-				}
-			}
+			nodeInfo.broadcast("ELECTION_COORD " + strconv.Itoa(nodeInfo.port))
 			return
 		}
 
@@ -314,12 +309,21 @@ func (nodeInfo *node) watchNeighbors() {
 		}
 		for _, dead := range nodeInfo.dropExpired() {
 			log.Printf("[%d] no ping from %d for %v, dropping it", nodeInfo.port, dead, heartbeatTTL)
-			for _, port := range nodeInfo.neighborList() {
-				if _, err := request(port, "DROP "+strconv.Itoa(dead)); err != nil {
-					log.Printf("[%d] drop %d at %d: %v", nodeInfo.port, dead, port, err)
-				}
-			}
+			nodeInfo.broadcast("DROP " + strconv.Itoa(dead))
 		}
+	}
+}
+
+// broadcast a mesage to all nodes, and log the amount of replies
+func (nodeInfo *node) broadcast(msg string) {
+	neighbors := nodeInfo.neighborList()
+	if len(neighbors) == 0 {
+		return
+	}
+	cmd, _, _ := strings.Cut(msg, " ")
+	replies, err := survey(neighbors, msg)
+	if err != nil || len(replies) < len(neighbors) {
+		log.Printf("[%d] %s only reached %d/%d neighbors (%v)", nodeInfo.port, cmd, len(replies), len(neighbors), err)
 	}
 }
 
@@ -378,13 +382,13 @@ func main() {
 	log.Printf("[%d] up, neighbors %v", nodeInfo.port, nodeInfo.neighbors)
 	go nodeInfo.serve()
 
-	// tell every node we exist, they reply with their coordinator
-	for _, port := range nodeInfo.neighborList() {
-		reply, err := request(port, "JOIN "+strconv.Itoa(nodeInfo.port))
-		if err != nil {
-			log.Printf("[%d] join %d: %v", nodeInfo.port, port, err)
-			continue
-		}
+	// tell every node we exist in one survey, they reply with their coordinator
+	neighbors := nodeInfo.neighborList()
+	replies, err := survey(neighbors, "JOIN "+strconv.Itoa(nodeInfo.port))
+	if len(neighbors) > 0 && (err != nil || len(replies) < len(neighbors)) {
+		log.Printf("[%d] JOIN only reached %d/%d neighbors (%v)", nodeInfo.port, len(replies), len(neighbors), err)
+	}
+	for _, reply := range replies {
 		// take the first one that knows
 		if coord, err := strconv.Atoi(reply); err == nil && coord != 0 && nodeInfo.getCoordinator() == 0 {
 			nodeInfo.setCoordinator(coord)
